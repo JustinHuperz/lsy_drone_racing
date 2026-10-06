@@ -49,7 +49,7 @@ class StateController(Controller):
         gates_pos = obs["gates_pos"]
         gates_quat = obs["gates_quat"]
         d = 0.3  # Abstand vor und hinter dem Gate in m
-        waypoints = [start_pos, start_pos + np.array([0.0, 0.0, 0.3])]  # erst hochsteigen
+        waypoints = [start_pos]
         for gate_idx, direction in zip(obs["gate_sequence"], obs["gate_sequence_direction"]):
             p = gates_pos[gate_idx]
             normal = R.from_quat(gates_quat[gate_idx]).apply([1.0, 0.0, 0.0]) * direction
@@ -65,21 +65,24 @@ class StateController(Controller):
         self._finished = False
         self._z_offset = 0.0  # aufsummierte Höhenkorrektur in m
         self._ki = 1.5  # Stärke des Integralanteils
+        self._verbose = False  # auf True setzen, um die Ausgaben wieder zu sehen
 
         self._known_gates_pos = np.array(obs["gates_pos"])
 
         self._known_obst_pos = np.array(obs["obstacles_pos"])
 
     def _safe_spline(self, waypoints, t0, bc_type, obs):
-        """Spline bauen und Ausweichpunkte einfügen, bis Pfosten und Rahmen frei sind."""
+        """Spline bauen und Ausweichpunkte einfügen, bis Pfosten und Gate-Rahmen frei sind."""
         speed = 0.8
-        # Hindernisse als senkrechte Stangen: (x, y, Sicherheitsradius)
-        poles = [(o[0], o[1], 0.2) for o in obs["obstacles_pos"]]
-        for p, q in zip(obs["gates_pos"], obs["gates_quat"]):
-            side = R.from_quat(q).apply([0.0, 1.0, 0.0])  # Richtung quer zum Gate
-            for s in (-0.28, 0.28):  # linker und rechter Rahmen
-                poles.append((p[0] + s * side[0], p[1] + s * side[1], 0.18))
+        poles = np.array([(o[0], o[1], 0.2) for o in obs["obstacles_pos"]])  # x, y, Radius
+        gates = []
+        for c, q in zip(obs["gates_pos"], obs["gates_quat"]):
+            rot = R.from_quat(q)
+            n = rot.apply([1.0, 0.0, 0.0])  # Durchflugrichtung
+            s = rot.apply([0.0, 1.0, 0.0])  # quer zum Gate
+            gates.append((np.array(c), n, s))
         waypoints = [np.array(w, dtype=float) for w in waypoints]
+        movable = [False] * len(waypoints)  # nur eingefügte Ausweichpunkte dürfen verschoben werden
         for _ in range(40):
             wp = np.array(waypoints)
             seg_len = np.maximum(np.linalg.norm(np.diff(wp, axis=0), axis=1), 1e-3)
@@ -87,27 +90,56 @@ class StateController(Controller):
             spline = CubicSpline(t, wp, bc_type=bc_type)
             ts = np.arange(t[0] + 0.1, t[-1], 0.02)  # Bahn in kleinen Schritten ablaufen
             path = spline(ts)
-            hit = None
-            for k, pt in enumerate(path):
-                for px, py, r in poles:
-                    diff = pt[:2] - np.array([px, py])
-                    dist = np.linalg.norm(diff)
-                    if dist < r:
-                        hit = (k, px, py, r, diff, dist)
-                        break
-                if hit:
-                    break
-            if hit is None:  # Bahn ist frei
+            first_k, new = None, None
+
+            # 1) Pfosten: senkrechte Stangen
+            diffs = path[:, None, :2] - poles[None, :, :2]
+            dists = np.linalg.norm(diffs, axis=2)
+            inside = dists < poles[None, :, 2]
+            if inside.any():
+                k, j = np.argwhere(inside)[0]
+                d = diffs[k, j] if dists[k, j] > 1e-6 else np.array([1.0, 0.0])
+                first_k = k
+                new = path[k].copy()
+                new[:2] = poles[j, :2] + d / np.linalg.norm(d) * (poles[j, 2] + 0.15)
+
+            # 2) Gate-Rahmen: die ganze Gate-Ebene ist gesperrt, nur die Öffnung ist frei
+            for c, n, s in gates:
+                rel = path - c
+                a = rel @ n  # Abstand vor/hinter dem Gate
+                l = rel @ s  # Abstand seitlich von der Mitte
+                dz = rel[:, 2]  # Abstand nach oben/unten
+                in_opening = (np.abs(l) < 0.14) & (np.abs(dz) < 0.14)
+                hit = (np.abs(a) < 0.08) & (np.abs(l) < 0.46) & ~in_opening
+                if hit.any():
+                    k = int(np.argmax(hit))
+                    if first_k is None or k < first_k:
+                        first_k = k
+                        if abs(l[k]) < 0.2 and abs(dz[k]) < 0.2:
+                            new = c + a[k] * n  # knapp am Rand der Öffnung: zur Mitte schieben
+                        else:
+                            # außen um das Gate herum, auf der Seite mit mehr Abstand zu den Pfosten
+                            best = None
+                            for side in (1.0, -1.0):
+                                cand = path[k] + (side * 0.65 - l[k]) * s
+                                clear = np.min(np.linalg.norm(poles[:, :2] - cand[:2], axis=1))
+                                if side == np.sign(l[k] + 1e-9):
+                                    clear += 0.05  # bei Gleichstand die nähere Seite nehmen
+                                if best is None or clear > best[0]:
+                                    best = (clear, cand)
+                            new = best[1]
+
+            if first_k is None:  # Bahn ist frei
                 break
-            k, px, py, r, diff, dist = hit
-            if dist < 1e-6:  # genau auf der Stange: quer zur Flugrichtung ausweichen
-                vel = spline(ts[k], 1)
-                diff = np.array([-vel[1], vel[0]])
-                dist = np.linalg.norm(diff) + 1e-9
-            new = path[k].copy()
-            new[:2] = np.array([px, py]) + diff / dist * (r + 0.1)  # nach außen schieben
-            idx = int(np.searchsorted(t, ts[k]))
-            waypoints.insert(idx, new)
+            # Gibt es schon einen Ausweichpunkt in der Nähe, wird der weiter rausgeschoben,
+            # statt immer neue Punkte dicht nebeneinander einzufügen.
+            near = [i for i in range(len(waypoints)) if movable[i] and np.linalg.norm(waypoints[i] - new) < 0.25]
+            if near:
+                waypoints[near[0]] = new + 0.5 * (new - path[first_k])
+            else:
+                idx = int(np.searchsorted(t, ts[first_k]))
+                waypoints.insert(idx, new)
+                movable.insert(idx, True)
         return spline, t[-1]
 
     def _replan(self, obs, t_now):
@@ -150,7 +182,7 @@ class StateController(Controller):
             numpy array.
         """
         self._last_obs = obs
-        if self._tick % self._freq == 0:  # einmal pro Sekunde
+        if self._verbose and self._tick % self._freq == 0:  # einmal pro Sekunde
             print(f"\nt = {self._tick / self._freq:.0f} s")
             print("Drohne:", np.round(obs["pos"], 2))
             print("Soll:  ", np.round(self._des_pos_spline(min(self._tick / self._freq, self._t_total)), 2))
