@@ -74,7 +74,7 @@ class StateController(Controller):
     def _safe_spline(self, waypoints, t0, bc_type, obs):
         """Spline bauen und Ausweichpunkte einfügen, bis Pfosten und Gate-Rahmen frei sind."""
         speed = 0.8
-        poles = np.array([(o[0], o[1], 0.2) for o in obs["obstacles_pos"]])  # x, y, Radius
+        poles = np.array([(o[0], o[1], 0.15) for o in obs["obstacles_pos"]])  # x, y, Radius
         gates = []
         for c, q in zip(obs["gates_pos"], obs["gates_quat"]):
             rot = R.from_quat(q)
