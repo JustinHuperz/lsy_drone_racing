@@ -41,6 +41,12 @@ class StateController(Controller):
         super().__init__(obs, info, config)
         self._freq = config.env.freq
 
+        self._v_top = 2.0  # Höchstgeschwindigkeit in m/s
+        self._v_gate = 1.0  # Tempo im Anflug auf ein Gate in m/s
+        self._approach = 0.8  # Länge der Anflugzone vor jedem Gate in m
+        self._a_lat = 2.5  # maximale Querbeschleunigung in Kurven in m/s²
+        self._a_long = 2.5  # maximale Beschleunigung und Bremsung in m/s²
+
 
 
         #####neu
@@ -58,14 +64,18 @@ class StateController(Controller):
             waypoints.append(p + d * normal)
         waypoints = np.array(waypoints)
 
-        self._des_pos_spline, self._t_total = self._safe_spline(waypoints, 0.0, "not-a-knot", obs)
-
-
+        geo, u_end = self._safe_spline(waypoints, 0.0, "not-a-knot", obs)  # Schritt A: Geometrie
+        self._des_pos_spline, self._t_total = self._retime(geo, 0.0, u_end, 0.0, 0.0, obs)
         self._tick = 0
         self._finished = False
         self._z_offset = 0.0  # aufsummierte Höhenkorrektur in m
         self._ki = 1.5  # Stärke des Integralanteils
         self._verbose = False  # auf True setzen, um die Ausgaben wieder zu sehen
+        self._ff_vel = np.zeros(3)  # geglättete Vorsteuerung: Geschwindigkeit
+        self._ff_acc = np.zeros(3)  # geglättete Vorsteuerung: Beschleunigung
+        self._tau_ff = 0.1  # Zeitkonstante des Glättungsfilters in s
+
+
 
         self._known_gates_pos = np.array(obs["gates_pos"])
 
@@ -74,7 +84,7 @@ class StateController(Controller):
     def _safe_spline(self, waypoints, t0, bc_type, obs):
         """Spline bauen und Ausweichpunkte einfügen, bis Pfosten und Gate-Rahmen frei sind."""
         speed = 0.8
-        poles = np.array([(o[0], o[1], 0.15) for o in obs["obstacles_pos"]])  # x, y, Radius
+        poles = np.array([(o[0], o[1], 0.18) for o in obs["obstacles_pos"]])  # x, y, Radius
         gates = []
         for c, q in zip(obs["gates_pos"], obs["gates_quat"]):
             rot = R.from_quat(q)
@@ -142,6 +152,38 @@ class StateController(Controller):
                 movable.insert(idx, True)
         return spline, t[-1]
 
+
+    def _retime(self, geo, u0, u1, v_start, t_start, obs):
+        """Geschwindigkeit entlang der fertigen Bahn neu verteilen (die Form bleibt gleich)."""
+        u = np.append(np.arange(u0, u1, 0.01), u1)  # Bahn in kleinen Schritten ablaufen
+        p = geo(u)
+        d1 = geo(u, 1)
+        d2 = geo(u, 2)
+        ds = np.maximum(np.linalg.norm(np.diff(p, axis=0), axis=1), 1e-6)  # Länge der kleinen Stücke
+        speed_u = np.maximum(np.linalg.norm(d1, axis=1), 1e-6)
+        kappa = np.linalg.norm(np.cross(d1, d2), axis=1) / speed_u**3  # Krümmung
+        # Schritt B: Tempolimit durch Kurven und Höchstgeschwindigkeit
+        v = np.minimum(self._v_top, np.sqrt(self._a_lat / np.maximum(kappa, 1e-6)))
+        # langsamer im Anflug auf jedes Gate, damit die Korrektur nach dem Neuplanen gelingt
+        for c, q in zip(obs["gates_pos"], obs["gates_quat"]):
+            rel = R.from_quat(q).inv().apply(p - np.array(c))  # im Koordinatensystem des Gates
+            zone = (rel[:, 0] > -self._approach) & (rel[:, 0] < 0.0) & (np.abs(rel[:, 1]) < 0.4)
+            v = np.where(zone, np.minimum(v, self._v_gate), v)        
+        v[0] = min(v[0], v_start)
+        v[-1] = 0.0  # am Ende stillstehen
+        # Schritt C: vorwärts beschleunigen, rückwärts bremsen
+        for i in range(len(v) - 1):
+            v[i + 1] = min(v[i + 1], np.sqrt(v[i] ** 2 + 2 * self._a_long * ds[i]))
+        for i in range(len(v) - 2, -1, -1):
+            v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2 * self._a_long * ds[i]))
+        # Schritt D: neue Zeitachse und neue Spline
+        dt = 2 * ds / np.maximum(v[:-1] + v[1:], 1e-3)
+        t = t_start + np.concatenate([[0.0], np.cumsum(dt)])
+        keep = np.r_[0, np.arange(3, len(t) - 3, 3), len(t) - 1]  # jeden 3. Punkt nehmen, glättet
+        v0 = d1[0] / speed_u[0] * v[0]  # Startgeschwindigkeit in Bahnrichtung
+        spline = CubicSpline(t[keep], p[keep], bc_type=((1, v0), (1, np.zeros(3))))
+        return spline, t[-1]
+
     def _replan(self, obs, t_now):
         """Restliche Bahn ab dem aktuellen Sollpunkt neu planen."""
         t_eval = min(t_now, self._t_total)
@@ -163,10 +205,12 @@ class StateController(Controller):
             waypoints.append(p)
             waypoints.append(p + d * normal)
         waypoints = np.array(waypoints)
-        bc = ((1, v0), "not-a-knot")
-        self._des_pos_spline, self._t_total = self._safe_spline(waypoints, t_now, bc, obs)
-
-
+        v_now = np.linalg.norm(v0)  # echte aktuelle Geschwindigkeit
+        v_dir = v0 / v_now * 0.8 if v_now > 1e-3 else np.zeros(3)  # nur die Richtung für die Geometrie
+        bc = ((1, v_dir), "not-a-knot")
+        geo, u_end = self._safe_spline(waypoints, 0.0, bc, obs)  # Schritt A: Geometrie
+        self._des_pos_spline, self._t_total = self._retime(geo, 0.0, u_end, v_now, t_now, obs)
+        
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
@@ -211,7 +255,9 @@ class StateController(Controller):
         if t >= self._t_total:  # am Ende stillstehen
             des_vel = np.zeros(3)
             des_acc = np.zeros(3)
-
+        alpha = (1.0 / self._freq) / (self._tau_ff + 1.0 / self._freq)  # Filtergewicht pro Schritt
+        self._ff_acc = self._ff_acc + alpha * (des_acc - self._ff_acc)
+        des_acc = self._ff_acc
         z_error = obs["pos"][2] - des_pos[2]
         self._z_offset += self._ki * z_error / self._freq
         self._z_offset = np.clip(self._z_offset, -0.2, 0.2)  # Sicherheitsgrenze
@@ -237,6 +283,24 @@ class StateController(Controller):
         Returns:
             True if the controller is finished, False otherwise.
         """
+        if terminated and obs["n_gates_passed"] < len(obs["gate_sequence"]):
+            t_now = min(self._tick / self._freq, self._t_total)
+            pos = np.array(self._last_obs["pos"])  # letzte gültige Position vor dem Absturz
+            speed = np.linalg.norm(self._last_obs["vel"])
+            print(
+                f"ABSTURZ bei t = {t_now:.2f} s, Gates: {obs['n_gates_passed']}, "
+                f"Drohne: {np.round(pos, 2)}, Soll: {np.round(self._des_pos_spline(t_now), 2)}, "
+                f"Tempo: {speed:.2f} m/s"
+            )
+            for g, (c, q) in enumerate(zip(self._last_obs["gates_pos"], self._last_obs["gates_quat"])):
+                rel = R.from_quat(q).inv().apply(pos - c)  # Position im Koordinatensystem des Gates
+                if np.linalg.norm(rel) < 0.6:
+                    print(f"  nahe Gate {g}: vor/hinter {rel[0]:+.2f}, seitlich {rel[1]:+.2f}, Höhe {rel[2]:+.2f}")
+            d_obst = np.linalg.norm(np.array(self._last_obs["obstacles_pos"])[:, :2] - pos[:2], axis=1)
+            print(f"  nächster Pfosten: {d_obst.min():.2f} m")
+
+
+        
         self._tick += 1
         return self._finished
 
