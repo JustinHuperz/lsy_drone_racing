@@ -1,12 +1,24 @@
-"""Controller that follows a pre-defined trajectory.
+"""Level-2-Controller: feste, optimierte Rennlinie mit weicher Korrektur.
 
-It uses a cubic spline interpolation to generate a smooth trajectory through a series of waypoints.
-At each time step, the controller computes the next desired position by evaluating the spline.
+Idee:
+1. Die Level-2-Strecke ist bekannt (nominale Lage aller Gates und Pfosten in level2.toml). Deshalb
+   wird vorab eine feste Rennlinie durch alle Gates gelegt (RACING_LINE). Die Wegpunkte wurden
+   offline mit einem Optimierer (CMA-ES) bestimmt: kürzeste geplante Flugzeit unter den
+   Nebenbedingungen Mindestabstand zu den Pfosten (0,36 m), kein Kontakt mit den Gate-Rahmen
+   (Drohne als 14 x 14 x 4 cm Box, plus Reserve für die zufällige Verschiebung der Gates) und
+   Abstand zum Rand des Spielfelds.
+2. Entlang dieser Linie wird ein zeitoptimales Geschwindigkeitsprofil berechnet: Höchst-
+   geschwindigkeit, Kurvenlimit über die Querbeschleunigung, begrenztes Beschleunigen und Bremsen.
+   Vor Gates, deren echte Lage noch unbekannt ist, wird etwas langsamer geflogen.
+3. Sobald ein Gate in Sensorreichweite kommt und seine echte Lage bekannt ist, wird das Bahnstück
+   um dieses Gate starr mit verschoben und gedreht, weich ein- und ausgeblendet. Es wird nicht neu
+   geplant, deshalb springen Geschwindigkeit und Beschleunigung nicht.
+4. Der eingebaute Positionsregler wird verstärkt, indem zum Sollwert ein Korrekturterm addiert
+   wird. Die Sollbeschleunigung wird leicht vorausgeschickt, weil die Drohne Zeit zum Neigen
+   braucht, und um 10 % erhöht, weil der Regler in der Simulation mit einer zu kleinen Masse
+   rechnet (39,3 g statt 43,4 g). Eine Integralkorrektur gleicht eine bleibende Höhenabweichung aus.
 
-.. note::
-    The waypoints are hard-coded in the controller for demonstration purposes. In practice, you
-    would need to generate the splines adaptively based on the track layout, and recompute the
-    trajectory if you receive updated gate and obstacle poses.
+Die Rennlinie gilt nur für die Level-2-Strecke.
 """
 
 from __future__ import annotations
@@ -25,249 +37,255 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
-class StateController(Controller):
-    """State controller following a pre-defined trajectory."""
+# Rennlinie für die Level-2-Strecke, Punkt für Punkt in Flugreihenfolge (Start = Drohnenposition):
+#   ("frei", [x, y, z])          Wegpunkt in Weltkoordinaten
+#   ("gate", k, [dx, dy, dz])    Punkt relativ zu dem Gate, das beim k-ten Durchflug dran ist
+#                                (dx = Durchflugrichtung, dy = seitlich, dz = nach oben).
+#                                [0, 0, 0] ist die Gate-Mitte und markiert den Durchflug.
+RACING_LINE = [
+    ("frei", [-0.246, 0.395, 0.604]),
+    ("gate", 0, [-0.307, -0.134, -0.01]),
+    ("gate", 0, [0.0, 0.0, 0.0]),
+    ("gate", 0, [0.432, -0.021, 0.014]),
+    ("frei", [1.067, -0.239, 0.815]),
+    ("gate", 1, [-0.532, 0.08, -0.094]),
+    ("gate", 1, [0.0, 0.0, 0.0]),
+    ("gate", 1, [0.211, 0.084, 0.1]),
+    ("frei", [0.267, 0.471, 1.291]),  # über die obere Ecke von Gate 0 hinweg
+    ("gate", 2, [-0.126, -0.065, 0.006]),
+    ("gate", 2, [0.0, 0.0, 0.0]),
+    ("gate", 2, [0.151, 0.129, 0.009]),
+    ("frei", [-1.232, -0.909, 0.849]),
+    ("frei", [-0.997, -1.149, 0.932]),
+    ("frei", [-0.471, -1.249, 1.084]),  # unter Pfosten 3 durch
+    ("gate", 3, [-0.141, -0.124, 0.008]),
+    ("gate", 3, [0.0, 0.0, 0.0]),
+    ("gate", 3, [0.449, 0.15, -0.044]),
+    ("frei", [1.299, 0.011, 1.186]),
+    ("gate", 4, [-0.513, 0.064, 0.013]),
+    ("gate", 4, [0.0, 0.0, 0.0]),
+    ("gate", 4, [0.519, -0.009, 0.082]),
+    ("frei", [1.096, 1.192, 1.438]),  # Auslauf nach dem letzten Gate
+]
+
+
+class Level2Controller(Controller):
+    """Folgt einer festen Rennlinie und korrigiert sie lokal, sobald Gates sichtbar werden."""
+
+    # Geschwindigkeitsprofil (die Rennlinie ist für genau diese Werte optimiert)
+    V_TOP = 2.5  # Höchstgeschwindigkeit in m/s
+    A_LAT = 3.5  # maximale Querbeschleunigung in Kurven in m/s²
+    A_LONG = 4.0  # maximale Beschleunigung und Bremsung in m/s²
+    V_GATE = 1.8  # Tempolimit im Anflug auf ein Gate, dessen echte Lage noch unbekannt ist, in m/s
+    D_SLOW = 0.7  # Länge dieser Anflugzone vor dem Gate in m
+
+    # Korrektur, wenn ein Gate sichtbar wird
+    D_HOLD = 0.5  # bis zu diesem Abstand hinter dem Gate bleibt die Korrektur voll aktiv in m
+    T_MIN_IN = 0.3  # kürzeste Einblendzeit in s
+    T_OUT_MAX = 1.2  # längste Ausblendzeit danach in s (sonst bis kurz vor das nächste Gate)
+
+    # Regelung
+    K_POS = 2.0  # zusätzliche Verstärkung auf den Positionsfehler (nur x, y)
+    K_VEL = 1.0  # zusätzliche Verstärkung auf den Geschwindigkeitsfehler (nur x, y)
+    ACC_LOOKAHEAD = 0.1  # Sollbeschleunigung so weit vorausschicken in s
+    FF_SCALE = 1.1  # Faktor auf die Sollbeschleunigung (gleicht die zu kleine Reglermasse aus)
+    MAX_POS_BOOST = 0.3  # Begrenzung des Positions-Korrekturterms in m
+    MAX_VEL_BOOST = 1.0  # Begrenzung des Geschwindigkeits-Korrekturterms in m/s
+    MAX_ACC = 8.0  # Begrenzung der waagerechten Sollbeschleunigung in m/s²
+    KI_Z = 1.5  # Integralverstärkung für die Höhe
+    Z_INT_MAX = 0.2  # Begrenzung der Höhenkorrektur in m
+
+    # Diagnose
+    VERBOSE = True  # bei einem Absturz die Ursache ausgeben
 
     def __init__(self, obs: dict[str, NDArray[np.floating]], info: dict, config: dict):
-        """Initialization of the controller.
-
-        Args:
-            obs: The initial observation of the environment's state. See the environment's
-                observation space for details.
-            info: The initial environment information from the reset.
-            config: The race configuration. See the config files for details. Contains additional
-                information such as disturbance configurations, randomizations, etc.
-        """
+        """Rennlinie aufbauen und Geschwindigkeitsprofil berechnen."""
         super().__init__(obs, info, config)
         self._freq = config.env.freq
+        track = config.env.track
+        self._nom_gate_pos = np.array([g["pos"] for g in track.gates], dtype=float)
+        self._nom_gate_yaw = np.array([g["rpy"][2] for g in track.gates], dtype=float)
+        order = np.asarray(track.gate_order)
+        self._pass_gate = np.abs(order) - 1  # Gate-Nummer je Durchflug
+        self._pass_dir = np.sign(order)  # Durchflugrichtung je Durchflug
 
-        self._v_top = 2.0  # Höchstgeschwindigkeit in m/s
-        self._v_gate = 1.0  # Tempo im Anflug auf ein Gate in m/s
-        self._approach = 0.8  # Länge der Anflugzone vor jedem Gate in m
-        self._a_lat = 2.5  # maximale Querbeschleunigung in Kurven in m/s²
-        self._a_long = 2.5  # maximale Beschleunigung und Bremsung in m/s²
+        # 1) Wegpunkte aus der Rennlinie
+        points, pass_idx = [np.array(obs["pos"], dtype=float)], {}
+        for kind, a, *rest in RACING_LINE:
+            if kind == "frei":
+                points.append(np.array(a, dtype=float))
+                continue
+            k, offset = a, np.array(rest[0], dtype=float)
+            g = self._pass_gate[k]
+            offset[0] *= self._pass_dir[k]
+            points.append(self._nom_gate_pos[g] + self._yaw_matrix(self._nom_gate_yaw[g]) @ offset)
+            if not offset.any():
+                pass_idx[k] = len(points) - 1
+        points = np.array(points)
 
+        # 2) Form der Bahn: Spline durch die Wegpunkte (Parameter = Länge der Verbindungen)
+        seg = np.maximum(np.linalg.norm(np.diff(points, axis=0), axis=1), 1e-3)
+        u = np.concatenate([[0.0], np.cumsum(seg)])
+        zero = np.zeros(3)
+        geo = CubicSpline(u, points, bc_type=((1, zero), (1, zero)))
 
+        # 3) Geschwindigkeitsprofil und Zeit-Spline
+        self._pass_u = {k: u[i] for k, i in sorted(pass_idx.items())}
+        self._spline, self._t_total = self._time_parametrize(geo, u[-1])
+        self._pass_t = {k: float(np.interp(uu, self._s, self._t)) for k, uu in self._pass_u.items()}
+        self._windows = self._make_windows()
 
-        #####neu
-        # Wegpunkte aus den Gate-Positionen berechnen
-        start_pos = obs["pos"]
-        gates_pos = obs["gates_pos"]
-        gates_quat = obs["gates_quat"]
-        d = 0.3  # Abstand vor und hinter dem Gate in m
-        waypoints = [start_pos]
-        for gate_idx, direction in zip(obs["gate_sequence"], obs["gate_sequence_direction"]):
-            p = gates_pos[gate_idx]
-            normal = R.from_quat(gates_quat[gate_idx]).apply([1.0, 0.0, 0.0]) * direction
-            waypoints.append(p - d * normal)
-            waypoints.append(p)
-            waypoints.append(p + d * normal)
-        waypoints = np.array(waypoints)
-
-        geo, u_end = self._safe_spline(waypoints, 0.0, "not-a-knot", obs)  # Schritt A: Geometrie
-        self._des_pos_spline, self._t_total = self._retime(geo, 0.0, u_end, 0.0, 0.0, obs)
+        self._gate_corr = {}  # Gate -> (Zeitpunkt der Aufdeckung, Drehmatrix, nominal, echt)
+        self._z_int = 0.0
         self._tick = 0
         self._finished = False
-        self._z_offset = 0.0  # aufsummierte Höhenkorrektur in m
-        self._ki = 1.5  # Stärke des Integralanteils
-        self._verbose = False  # auf True setzen, um die Ausgaben wieder zu sehen
-        self._ff_vel = np.zeros(3)  # geglättete Vorsteuerung: Geschwindigkeit
-        self._ff_acc = np.zeros(3)  # geglättete Vorsteuerung: Beschleunigung
-        self._tau_ff = 0.1  # Zeitkonstante des Glättungsfilters in s
+        self._last_obs = obs
+        if self.VERBOSE:
+            print(f"[Level2Controller] Rennlinie geladen, geplante Zeit bis zum letzten Gate: "
+                  f"{max(self._pass_t.values()):.2f} s")
 
+    @staticmethod
+    def _yaw_matrix(yaw: float) -> NDArray[np.floating]:
+        c, s = np.cos(yaw), np.sin(yaw)
+        return np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]])
 
+    def _time_parametrize(self, geo: CubicSpline, u_end: float):
+        """Zeitoptimales Geschwindigkeitsprofil entlang der festen Bahnform."""
+        s = np.append(np.arange(0.0, u_end, 0.005), u_end)
+        p, d1, d2 = geo(s), geo(s, 1), geo(s, 2)
+        ds = np.maximum(np.linalg.norm(np.diff(p, axis=0), axis=1), 1e-6)
+        speed = np.maximum(np.linalg.norm(d1, axis=1), 1e-6)
+        kappa = np.linalg.norm(np.cross(d1, d2), axis=1) / speed**3  # Krümmung
+        v = np.minimum(self.V_TOP, np.sqrt(self.A_LAT / np.maximum(kappa, 1e-6)))
 
-        self._known_gates_pos = np.array(obs["gates_pos"])
+        # Anflugzonen: vor einem Gate, das bis dahin noch nicht in Sensorreichweite war, langsamer
+        for k, uk in self._pass_u.items():
+            c = self._nom_gate_pos[self._pass_gate[k]]
+            zone = (s < uk) & (np.linalg.norm(p - c, axis=1) < self.D_SLOW)
+            zone_start = s[zone].min() if zone.any() else uk
+            seen_before = np.any((s < zone_start) & (np.linalg.norm(p[:, :2] - c[:2], axis=1) < 0.6))
+            if not seen_before:
+                v = np.where(zone, np.minimum(v, self.V_GATE), v)
 
-        self._known_obst_pos = np.array(obs["obstacles_pos"])
-
-    def _safe_spline(self, waypoints, t0, bc_type, obs):
-        """Spline bauen und Ausweichpunkte einfügen, bis Pfosten und Gate-Rahmen frei sind."""
-        speed = 0.8
-        poles = np.array([(o[0], o[1], 0.18) for o in obs["obstacles_pos"]])  # x, y, Radius
-        gates = []
-        for c, q in zip(obs["gates_pos"], obs["gates_quat"]):
-            rot = R.from_quat(q)
-            n = rot.apply([1.0, 0.0, 0.0])  # Durchflugrichtung
-            s = rot.apply([0.0, 1.0, 0.0])  # quer zum Gate
-            gates.append((np.array(c), n, s))
-        waypoints = [np.array(w, dtype=float) for w in waypoints]
-        movable = [False] * len(waypoints)  # nur eingefügte Ausweichpunkte dürfen verschoben werden
-        for _ in range(40):
-            wp = np.array(waypoints)
-            seg_len = np.maximum(np.linalg.norm(np.diff(wp, axis=0), axis=1), 1e-3)
-            t = t0 + np.concatenate([[0.0], np.cumsum(seg_len / speed)])
-            spline = CubicSpline(t, wp, bc_type=bc_type)
-            ts = np.arange(t[0] + 0.1, t[-1], 0.02)  # Bahn in kleinen Schritten ablaufen
-            path = spline(ts)
-            first_k, new = None, None
-
-            # 1) Pfosten: senkrechte Stangen
-            diffs = path[:, None, :2] - poles[None, :, :2]
-            dists = np.linalg.norm(diffs, axis=2)
-            inside = dists < poles[None, :, 2]
-            if inside.any():
-                k, j = np.argwhere(inside)[0]
-                d = diffs[k, j] if dists[k, j] > 1e-6 else np.array([1.0, 0.0])
-                first_k = k
-                new = path[k].copy()
-                new[:2] = poles[j, :2] + d / np.linalg.norm(d) * (poles[j, 2] + 0.15)
-
-            # 2) Gate-Rahmen: die ganze Gate-Ebene ist gesperrt, nur die Öffnung ist frei
-            for c, n, s in gates:
-                rel = path - c
-                a = rel @ n  # Abstand vor/hinter dem Gate
-                l = rel @ s  # Abstand seitlich von der Mitte
-                dz = rel[:, 2]  # Abstand nach oben/unten
-                in_opening = (np.abs(l) < 0.14) & (np.abs(dz) < 0.14)
-                hit = (np.abs(a) < 0.08) & (np.abs(l) < 0.46) & ~in_opening
-                if hit.any():
-                    k = int(np.argmax(hit))
-                    if first_k is None or k < first_k:
-                        first_k = k
-                        if abs(l[k]) < 0.2 and abs(dz[k]) < 0.2:
-                            new = c + a[k] * n  # knapp am Rand der Öffnung: zur Mitte schieben
-                        else:
-                            # außen um das Gate herum, auf der Seite mit mehr Abstand zu den Pfosten
-                            best = None
-                            for side in (1.0, -1.0):
-                                cand = path[k] + (side * 0.65 - l[k]) * s
-                                clear = np.min(np.linalg.norm(poles[:, :2] - cand[:2], axis=1))
-                                if side == np.sign(l[k] + 1e-9):
-                                    clear += 0.05  # bei Gleichstand die nähere Seite nehmen
-                                if best is None or clear > best[0]:
-                                    best = (clear, cand)
-                            new = best[1]
-
-            if first_k is None:  # Bahn ist frei
-                break
-            # Gibt es schon einen Ausweichpunkt in der Nähe, wird der weiter rausgeschoben,
-            # statt immer neue Punkte dicht nebeneinander einzufügen.
-            near = [i for i in range(len(waypoints)) if movable[i] and np.linalg.norm(waypoints[i] - new) < 0.25]
-            if near:
-                waypoints[near[0]] = new + 0.5 * (new - path[first_k])
-            else:
-                idx = int(np.searchsorted(t, ts[first_k]))
-                waypoints.insert(idx, new)
-                movable.insert(idx, True)
-        return spline, t[-1]
-
-
-    def _retime(self, geo, u0, u1, v_start, t_start, obs):
-        """Geschwindigkeit entlang der fertigen Bahn neu verteilen (die Form bleibt gleich)."""
-        u = np.append(np.arange(u0, u1, 0.01), u1)  # Bahn in kleinen Schritten ablaufen
-        p = geo(u)
-        d1 = geo(u, 1)
-        d2 = geo(u, 2)
-        ds = np.maximum(np.linalg.norm(np.diff(p, axis=0), axis=1), 1e-6)  # Länge der kleinen Stücke
-        speed_u = np.maximum(np.linalg.norm(d1, axis=1), 1e-6)
-        kappa = np.linalg.norm(np.cross(d1, d2), axis=1) / speed_u**3  # Krümmung
-        # Schritt B: Tempolimit durch Kurven und Höchstgeschwindigkeit
-        v = np.minimum(self._v_top, np.sqrt(self._a_lat / np.maximum(kappa, 1e-6)))
-        # langsamer im Anflug auf jedes Gate, damit die Korrektur nach dem Neuplanen gelingt
-        for c, q in zip(obs["gates_pos"], obs["gates_quat"]):
-            rel = R.from_quat(q).inv().apply(p - np.array(c))  # im Koordinatensystem des Gates
-            zone = (rel[:, 0] > -self._approach) & (rel[:, 0] < 0.0) & (np.abs(rel[:, 1]) < 0.4)
-            v = np.where(zone, np.minimum(v, self._v_gate), v)        
-        v[0] = min(v[0], v_start)
-        v[-1] = 0.0  # am Ende stillstehen
-        # Schritt C: vorwärts beschleunigen, rückwärts bremsen
-        for i in range(len(v) - 1):
-            v[i + 1] = min(v[i + 1], np.sqrt(v[i] ** 2 + 2 * self._a_long * ds[i]))
-        for i in range(len(v) - 2, -1, -1):
-            v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2 * self._a_long * ds[i]))
-        # Schritt D: neue Zeitachse und neue Spline
+        v[0] = v[-1] = 0.0  # Start und Ende im Stillstand
+        for i in range(len(v) - 1):  # vorwärts: Beschleunigen begrenzen
+            v[i + 1] = min(v[i + 1], np.sqrt(v[i] ** 2 + 2 * self.A_LONG * ds[i]))
+        for i in range(len(v) - 2, -1, -1):  # rückwärts: rechtzeitig bremsen
+            v[i] = min(v[i], np.sqrt(v[i + 1] ** 2 + 2 * self.A_LONG * ds[i]))
         dt = 2 * ds / np.maximum(v[:-1] + v[1:], 1e-3)
-        t = t_start + np.concatenate([[0.0], np.cumsum(dt)])
-        keep = np.r_[0, np.arange(3, len(t) - 3, 3), len(t) - 1]  # jeden 3. Punkt nehmen, glättet
-        v0 = d1[0] / speed_u[0] * v[0]  # Startgeschwindigkeit in Bahnrichtung
-        spline = CubicSpline(t[keep], p[keep], bc_type=((1, v0), (1, np.zeros(3))))
-        return spline, t[-1]
+        t = np.concatenate([[0.0], np.cumsum(dt)])
 
-    def _replan(self, obs, t_now):
-        """Restliche Bahn ab dem aktuellen Sollpunkt neu planen."""
-        t_eval = min(t_now, self._t_total)
-        p0 = self._des_pos_spline(t_eval)  # aktueller Sollpunkt
-        v0 = self._des_pos_spline(t_eval, 1)  # aktuelle Sollgeschwindigkeit
-        d = 0.3
-        speed = 0.8
-        waypoints = [p0]
-        first = int(obs["n_gates_passed"])  # erstes noch offenes Gate
-        for i in range(first, len(obs["gate_sequence"])):
-            g = obs["gate_sequence"][i]
-            p = obs["gates_pos"][g]
-            normal = R.from_quat(obs["gates_quat"][g]).apply([1.0, 0.0, 0.0])
-            normal = normal * obs["gate_sequence_direction"][i]
-            pre = p - d * normal
-            # Punkt vor dem aktuellen Gate weglassen, wenn wir schon daran vorbei sind
-            if i > first or np.dot(pre - p0, normal) > 0:
-                waypoints.append(pre)
-            waypoints.append(p)
-            waypoints.append(p + d * normal)
-        waypoints = np.array(waypoints)
-        v_now = np.linalg.norm(v0)  # echte aktuelle Geschwindigkeit
-        v_dir = v0 / v_now * 0.8 if v_now > 1e-3 else np.zeros(3)  # nur die Richtung für die Geometrie
-        bc = ((1, v_dir), "not-a-knot")
-        geo, u_end = self._safe_spline(waypoints, 0.0, bc, obs)  # Schritt A: Geometrie
-        self._des_pos_spline, self._t_total = self._retime(geo, 0.0, u_end, v_now, t_now, obs)
-        
+        self._s, self._p, self._t = s, p, t
+        keep = np.r_[0, np.arange(4, len(t) - 4, 4), len(t) - 1]  # jeden 4. Punkt, glättet
+        zero = np.zeros(3)
+        return CubicSpline(t[keep], p[keep], bc_type=((1, zero), (1, zero))), float(t[-1])
+
+    def _make_windows(self) -> dict:
+        """Je Durchflug: wann die Korrektur voll aktiv ist, bis wann sie bleibt, wie lange Ausblenden."""
+        s, p, t = self._s, self._p, self._t
+        ks = sorted(self._pass_t)
+        windows = {}
+        for k in ks:
+            c = self._nom_gate_pos[self._pass_gate[k]]
+            after = (s > self._pass_u[k]) & (np.linalg.norm(p - c, axis=1) >= self.D_HOLD)
+            t_down = t[after].min() if after.any() else t[-1]
+            windows[k] = [self._pass_t[k], t_down, self.T_OUT_MAX]
+        for a, b in zip(ks[:-1], ks[1:]):  # Ausblenden muss vor dem nächsten Gate fertig sein
+            windows[a][1] = max(min(windows[a][1], windows[b][0] - 0.35), self._pass_t[a])
+            windows[a][2] = float(np.clip(windows[b][0] - 0.25 - windows[a][1], 0.1, self.T_OUT_MAX))
+        return windows
+
+    @staticmethod
+    def _min_jerk(x):
+        """Weiche Rampe von 0 auf 1 und ihre ersten beiden Ableitungen nach x."""
+        x = np.clip(x, 0.0, 1.0)
+        return (
+            10 * x**3 - 15 * x**4 + 6 * x**5,
+            30 * x**2 - 60 * x**3 + 30 * x**4,
+            60 * x - 180 * x**2 + 120 * x**3,
+        )
+
+    def _ramp(self, t, t_start, t_full, t_down, t_out):
+        """Gewicht 0 -> 1 (t_start bis t_full), 1 bis t_down, dann 1 -> 0 in t_out. Mit Ableitungen."""
+        T_in = t_full - t_start
+        w_up, w1_up, w2_up = self._min_jerk((t - t_start) / T_in)
+        w_dn, w1_dn, w2_dn = self._min_jerk((t - t_down) / t_out)
+        up = t < t_full
+        w = np.where(up, w_up, 1.0 - w_dn)
+        w1 = np.where(up, w1_up / T_in, -w1_dn / t_out)
+        w2 = np.where(up, w2_up / T_in**2, -w2_dn / t_out**2)
+        return w, w1, w2
+
+    def _reference(self, t):
+        """Sollposition, -geschwindigkeit und -beschleunigung inkl. Gate-Korrekturen (t: Array)."""
+        t = np.clip(np.atleast_1d(np.asarray(t, dtype=float)), 0.0, self._t_total)
+        p, v, a = self._spline(t), self._spline(t, 1), self._spline(t, 2)
+        P, V, A = p.copy(), v.copy(), a.copy()
+        for k in self._pass_t:
+            g = self._pass_gate[k]
+            if g not in self._gate_corr:
+                continue
+            t_rev, M, g_nom, g_true = self._gate_corr[g]
+            t_full, t_down, t_out = self._windows[k]
+            earlier = [kk for kk in self._pass_t if kk < k]
+            # Einblenden erst, wenn das vorherige Gate hinter uns liegt
+            t_start = max(t_rev, self._windows[max(earlier)][1] if earlier else 0.0)
+            t_full = max(t_full, t_start + self.T_MIN_IN)
+            t_down = max(t_down, t_full)
+            w, w1, w2 = (x[:, None] for x in self._ramp(t, t_start, t_full, t_down, t_out))
+            c = g_true + (p - g_nom) @ M.T - p  # Bahn starr mit dem Gate verschieben und drehen
+            c1 = v @ M.T - v
+            c2 = a @ M.T - a
+            P += w * c
+            V += w * c1 + w1 * c
+            A += w * c2 + 2 * w1 * c1 + w2 * c
+        return P, V, A
+
+    def _update_gates(self, obs, t):
+        """Neu aufgedeckte Gates: Korrektur aus echter und nominaler Lage bestimmen."""
+        for g in range(len(self._nom_gate_pos)):
+            if g in self._gate_corr or not obs["gates_visited"][g]:
+                continue
+            true_yaw = R.from_quat(obs["gates_quat"][g]).as_euler("xyz")[2]
+            dyaw = (true_yaw - self._nom_gate_yaw[g] + np.pi) % (2 * np.pi) - np.pi
+            M = self._yaw_matrix(dyaw)
+            self._gate_corr[g] = (t, M, self._nom_gate_pos[g], np.array(obs["gates_pos"][g]))
+
+    @staticmethod
+    def _clip_norm(x, limit):
+        n = np.linalg.norm(x)
+        return x if n <= limit else x * (limit / n)
+
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
-        """Compute the next desired state of the drone.
-
-        Args:
-            obs: The current observation of the environment. See the environment's observation space
-                for details.
-            info: Optional additional information as a dictionary.
-
-        Returns:
-            The drone state [x, y, z, vx, vy, vz, ax, ay, az, qx, qy, qz, qw, wx, wy, wz] as a
-            numpy array.
-        """
+        """Sollzustand [x, y, z, vx, vy, vz, ax, ay, az, qx, qy, qz, qw, wx, wy, wz] berechnen."""
+        t = self._tick / self._freq
         self._last_obs = obs
-        if self._verbose and self._tick % self._freq == 0:  # einmal pro Sekunde
-            print(f"\nt = {self._tick / self._freq:.0f} s")
-            print("Drohne:", np.round(obs["pos"], 2))
-            print("Soll:  ", np.round(self._des_pos_spline(min(self._tick / self._freq, self._t_total)), 2))
-            print("Gates passiert:", obs["n_gates_passed"], "| Reihenfolge:", obs["gate_sequence"])
-            print("Gate-Positionen:\n", np.round(obs["gates_pos"], 2))
-        
-        gates_now = np.array(obs["gates_pos"])
-        obst_now = np.array(obs["obstacles_pos"])
-        gates_moved = np.any(np.abs(gates_now - self._known_gates_pos) > 1e-3)
-        obst_moved = np.any(np.abs(obst_now - self._known_obst_pos) > 1e-3)
-        if gates_moved or obst_moved:
-            self._known_gates_pos = gates_now
-            self._known_obst_pos = obst_now
+        self._update_gates(obs, t)
 
-            if obs["n_gates_passed"] < len(obs["gate_sequence"]):
-                self._replan(obs, self._tick / self._freq)
-                print(f"t = {self._tick / self._freq:.2f} s: neu geplant")
-        
-        t = min(self._tick / self._freq, self._t_total)
-        if t >= self._t_total:  # Maximum duration reached
+        Ps, Vs, As = self._reference([t, t + self.ACC_LOOKAHEAD])
+        P, V, A = Ps[0], Vs[0], As[1]  # Beschleunigung aus der nahen Zukunft
+        if t >= self._t_total:
+            V, A = np.zeros(3), np.zeros(3)
             self._finished = True
+        pos, vel = np.asarray(obs["pos"]), np.asarray(obs["vel"])
 
-        des_pos = self._des_pos_spline(t)
-        des_vel = self._des_pos_spline(t, 1)  # 1. Ableitung = Geschwindigkeit
-        des_acc = self._des_pos_spline(t, 2)  # 2. Ableitung = Beschleunigung
-        if t >= self._t_total:  # am Ende stillstehen
-            des_vel = np.zeros(3)
-            des_acc = np.zeros(3)
-        alpha = (1.0 / self._freq) / (self._tau_ff + 1.0 / self._freq)  # Filtergewicht pro Schritt
-        self._ff_acc = self._ff_acc + alpha * (des_acc - self._ff_acc)
-        des_acc = self._ff_acc
-        z_error = obs["pos"][2] - des_pos[2]
-        self._z_offset += self._ki * z_error / self._freq
-        self._z_offset = np.clip(self._z_offset, -0.2, 0.2)  # Sicherheitsgrenze
-        des_pos = des_pos.copy()
-        des_pos[2] -= self._z_offset
+        # Höhe: Integralanteil gegen bleibende Abweichung
+        self._z_int += self.KI_Z * (pos[2] - P[2]) / self._freq
+        self._z_int = float(np.clip(self._z_int, -self.Z_INT_MAX, self.Z_INT_MAX))
+        cmd_pos = P.copy()
+        cmd_pos[2] -= self._z_int
 
-        des_yaw = 0.0
-        des_quat = R.from_euler("z", des_yaw).as_quat()
-        action = np.concatenate((des_pos, des_vel, des_acc, des_quat, np.zeros(3)), dtype=np.float32)
-        return action
+        # Waagerecht: Regler verstärken, Vorsteuerung skalieren und begrenzen
+        xy = np.array([1.0, 1.0, 0.0])
+        cmd_pos += self._clip_norm(self.K_POS * (P - pos) * xy, self.MAX_POS_BOOST)
+        cmd_vel = V + self._clip_norm(self.K_VEL * (V - vel) * xy, self.MAX_VEL_BOOST)
+        cmd_acc = A * self.FF_SCALE
+        cmd_acc[:2] = self._clip_norm(cmd_acc[:2], self.MAX_ACC)
+
+        quat = np.array([0.0, 0.0, 0.0, 1.0])  # Gierwinkel 0
+        return np.concatenate((cmd_pos, cmd_vel, cmd_acc, quat, np.zeros(3)), dtype=np.float32)
 
     def step_callback(
         self,
@@ -278,43 +296,50 @@ class StateController(Controller):
         truncated: bool,
         info: dict,
     ) -> bool:
-        """Increment the time step counter.
-
-        Returns:
-            True if the controller is finished, False otherwise.
-        """
-        if terminated and obs["n_gates_passed"] < len(obs["gate_sequence"]):
-            t_now = min(self._tick / self._freq, self._t_total)
-            pos = np.array(self._last_obs["pos"])  # letzte gültige Position vor dem Absturz
-            speed = np.linalg.norm(self._last_obs["vel"])
-            print(
-                f"ABSTURZ bei t = {t_now:.2f} s, Gates: {obs['n_gates_passed']}, "
-                f"Drohne: {np.round(pos, 2)}, Soll: {np.round(self._des_pos_spline(t_now), 2)}, "
-                f"Tempo: {speed:.2f} m/s"
-            )
-            for g, (c, q) in enumerate(zip(self._last_obs["gates_pos"], self._last_obs["gates_quat"])):
-                rel = R.from_quat(q).inv().apply(pos - c)  # Position im Koordinatensystem des Gates
-                if np.linalg.norm(rel) < 0.6:
-                    print(f"  nahe Gate {g}: vor/hinter {rel[0]:+.2f}, seitlich {rel[1]:+.2f}, Höhe {rel[2]:+.2f}")
-            d_obst = np.linalg.norm(np.array(self._last_obs["obstacles_pos"])[:, :2] - pos[:2], axis=1)
-            print(f"  nächster Pfosten: {d_obst.min():.2f} m")
-
-
-        
+        """Zeitschritt mitzählen und bei einem Absturz die Ursache ausgeben."""
         self._tick += 1
+        n_passed = int(obs["n_gates_passed"])
+        if self.VERBOSE and terminated and n_passed < len(self._pass_gate):
+            self._print_crash(n_passed)
         return self._finished
 
+    def _print_crash(self, n_passed: int):
+        """Ursache eines Absturzes aus der letzten gültigen Beobachtung bestimmen und ausgeben."""
+        o = self._last_obs
+        t = (self._tick - 1) / self._freq
+        pos, speed = np.asarray(o["pos"]), np.linalg.norm(o["vel"])
+        err = self._reference(t)[0][0] - pos
+        cause = "unklar"
+        d_obst = np.linalg.norm(np.asarray(o["obstacles_pos"])[:, :2] - pos[:2], axis=1)
+        j = int(np.argmin(d_obst))
+        if d_obst[j] < 0.14:
+            cause = f"Pfosten {j} getroffen (Abstand {d_obst[j]:.2f} m)"
+        elif pos[2] < 0.1:
+            cause = "Boden berührt"
+        else:
+            for g in range(len(self._nom_gate_pos)):
+                rel = R.from_quat(o["gates_quat"][g]).inv().apply(pos - np.asarray(o["gates_pos"][g]))
+                if abs(rel[0]) < 0.15 and max(abs(rel[1]), abs(rel[2])) < 0.5:
+                    where = ("seitlich" if abs(rel[1]) > abs(rel[2])
+                             else ("oben" if rel[2] > 0 else "unten"))
+                    cause = (f"Rahmen von Gate {g} getroffen ({where}; vor/hinter {rel[0]:+.2f}, "
+                             f"seitlich {rel[1]:+.2f}, Höhe {rel[2]:+.2f} m)")
+                    break
+        seen = ""
+        if n_passed < len(self._pass_gate):
+            g_next = self._pass_gate[n_passed]
+            if g_next in self._gate_corr:
+                ahead = self._pass_t[n_passed] - self._gate_corr[g_next][0]
+                seen = f", nächstes Gate {g_next} wurde {ahead:.2f} s vor dem Durchflug sichtbar"
+        print(f"[Level2Controller] ABSTURZ bei t = {t:.2f} s nach {n_passed} Gates: {cause}. "
+              f"Abweichung Soll-Ist {np.linalg.norm(err):.2f} m, Tempo {speed:.1f} m/s{seen}")
+
     def episode_callback(self):
-        """Reset the internal state."""
+        """Zurücksetzen."""
         self._tick = 0
 
     def render_callback(self, sim: Sim):
-        """Visualize the desired trajectory and the current setpoint."""
-        setpoint = self._des_pos_spline(self._tick / self._freq).reshape(1, -1)
-        draw_points(sim, setpoint, rgba=(1.0, 0.0, 0.0, 1.0), size=0.02)
-        trajectory = self._des_pos_spline(np.linspace(self._tick / self._freq, self._t_total, 100))
-        draw_line(sim, trajectory, rgba=(0.0, 1.0, 0.0, 1.0))
-
-        for p, q in zip(self._last_obs["gates_pos"], self._last_obs["gates_quat"]):
-            normal = R.from_quat(q).apply([1.0, 0.0, 0.0])
-            draw_line(sim, np.array([p, p + 0.5 * normal]), rgba=(1.0, 0.0, 0.0, 1.0))
+        """Sollbahn (grün) und aktuellen Sollpunkt (rot) zeichnen."""
+        t = self._tick / self._freq
+        draw_line(sim, self._reference(np.linspace(t, self._t_total, 100))[0], rgba=(0.0, 1.0, 0.0, 1.0))
+        draw_points(sim, self._reference(t)[0], rgba=(1.0, 0.0, 0.0, 1.0), size=0.02)
