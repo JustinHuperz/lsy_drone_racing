@@ -21,4 +21,5 @@ site/
 .pixi/*
 !.pixi/config.toml
 ros_ws/
-acados/
+acados/c_generated_code/
+auswertung/
