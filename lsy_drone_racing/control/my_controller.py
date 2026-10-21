@@ -37,6 +37,9 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
 
+############Planer
+
+
 # Rennlinie für die Level-2-Strecke, Punkt für Punkt in Flugreihenfolge (Start = Drohnenposition):
 #   ("frei", [x, y, z])          Wegpunkt in Weltkoordinaten
 #   ("gate", k, [dx, dy, dz])    Punkt relativ zu dem Gate, das beim k-ten Durchflug dran ist
@@ -74,7 +77,7 @@ class Level2Controller(Controller):
 
     # Geschwindigkeitsprofil (die Rennlinie ist für genau diese Werte optimiert)
     V_TOP = 2.5  # Höchstgeschwindigkeit in m/s
-    A_LAT = 3.5  # maximale Querbeschleunigung in Kurven in m/s²
+    A_LAT = 4.0  # maximale Querbeschleunigung in Kurven in m/s²
     A_LONG = 4.0  # maximale Beschleunigung und Bremsung in m/s²
     V_GATE = 1.8  # Tempolimit im Anflug auf ein Gate, dessen echte Lage noch unbekannt ist, in m/s
     D_SLOW = 0.7  # Länge dieser Anflugzone vor dem Gate in m
@@ -83,6 +86,7 @@ class Level2Controller(Controller):
     D_HOLD = 0.5  # bis zu diesem Abstand hinter dem Gate bleibt die Korrektur voll aktiv in m
     T_MIN_IN = 0.3  # kürzeste Einblendzeit in s
     T_OUT_MAX = 1.2  # längste Ausblendzeit danach in s (sonst bis kurz vor das nächste Gate)
+    ROT_SCALE = 0.5  # Anteil der Gate-Drehung, den die Bahn mitmacht (weniger Pfosten-Treffer)
 
     # Regelung
     K_POS = 2.0  # zusätzliche Verstärkung auf den Positionsfehler (nur x, y)
@@ -248,13 +252,19 @@ class Level2Controller(Controller):
                 continue
             true_yaw = R.from_quat(obs["gates_quat"][g]).as_euler("xyz")[2]
             dyaw = (true_yaw - self._nom_gate_yaw[g] + np.pi) % (2 * np.pi) - np.pi
-            M = self._yaw_matrix(dyaw)
+            M = self._yaw_matrix(self.ROT_SCALE * dyaw)
             self._gate_corr[g] = (t, M, self._nom_gate_pos[g], np.array(obs["gates_pos"][g]))
 
     @staticmethod
     def _clip_norm(x, limit):
         n = np.linalg.norm(x)
         return x if n <= limit else x * (limit / n)
+
+############Planer Ende
+
+#############Regler 
+
+
 
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
@@ -286,6 +296,14 @@ class Level2Controller(Controller):
 
         quat = np.array([0.0, 0.0, 0.0, 1.0])  # Gierwinkel 0
         return np.concatenate((cmd_pos, cmd_vel, cmd_acc, quat, np.zeros(3)), dtype=np.float32)
+
+
+
+#############Reglerende
+
+
+
+
 
     def step_callback(
         self,

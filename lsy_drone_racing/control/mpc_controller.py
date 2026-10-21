@@ -71,7 +71,11 @@ RACING_LINE = [
 
 _SOLVERS = {}  # ein Solver pro Prozess, wird über alle Läufe wiederverwendet (Kompilieren dauert)
 
-
+##Kopfzeile: Nimmt die Modellparameter (params), die Anzahl der vorausschauenden Schritte im Horizont (N), die Horizontzeit in Sekunden (Tf), die Gewichtungsmatrizen (Q für Zustände, R_ für Stellgrößen), den maximalen Neigungswinkel (max_angle), den Flag für Real-Time Iterations (rti) sowie den Mindestschub (t_min) entgegen.
+##1.Physikalisches Systemmodell: kontinuierliche Systemdynamik $\dot{x} = f(x, u)$ als CasADi-Ausdruck (Position, Orientierung, Geschwindigkeit, Drehraten) und erweitern sie um ein lineares Dämpfungsmodell für den aerodynamischen Widerstand.
+##2.Optimal Control Problem (OCP): quadratisches Gütekriterium (Linear Least Squares) , das Abweichungen vom Sollzustand mit der Matrix $Q$ und Stellgrößenaufwand mit $R$ über den Prädiktionshorizont $N=25$ ($T_f = 0{,}5\text{ s}$) gewichtet.
+##3.Sicherheit & Stellgrößenbegrenzungen (Constraints):Einschränken des Lösungsraums auf die physikalisch machbaren Aktuatorgrenzen der Drohne (maximale Neigungswinkel und Schubgrenzen der 4 Motoren).
+##4.Solver-Kompilierung in C:„Um die Rechenzeit unter $2\text{ ms}$ zu halten, nutzen wir acados mit RTI (Real-Time Iteration) und HPIPM als QP-Solver, der das Problem in C-Code übersetzt.“
 def create_mpc_solver(params: dict, N: int, Tf: float, Q, R_, max_angle: float, rti: bool, t_min: float = 0.0):
     """NMPC mit dem identifizierten Modell so_rpy: Zustand [pos, rpy, vel, drpy], Eingang [r, p, y, Schub]."""
     key = (N, Tf, tuple(Q), tuple(R_), max_angle, rti, t_min, tuple(np.ravel(params.get('drag_acc', np.zeros(3)))), tuple(np.ravel(params['rpy_coef'])), tuple(np.ravel(params['rpy_rates_coef'])), float(params['cmd_f_coef']))
@@ -93,11 +97,11 @@ def create_mpc_solver(params: dict, N: int, Tf: float, Q, R_, max_angle: float, 
     nx, nu = X.rows(), U.rows()
     ny = nx + nu
     ocp.solver_options.N_horizon = N
-    ocp.cost.cost_type = ocp.cost.cost_type_e = "LINEAR_LS"
+    ocp.cost.cost_type = ocp.cost.cost_type_e = "LINEAR_LS" ##Kostenfunktions-Typ: Wählt für die Zwischenschritte (cost_type) und den Endschritt (cost_type_e) ein lineares Kleinste-Quadrate-Funktional (Linear Least Squares).
     ocp.cost.W = scipy.linalg.block_diag(np.diag(Q), np.diag(R_))
     ocp.cost.W_e = np.diag(Q)
     Vx = np.zeros((ny, nx)); Vx[:nx, :nx] = np.eye(nx)
-    Vu = np.zeros((ny, nu)); Vu[nx:, :] = np.eye(nu)
+    Vu = np.zeros((ny, nu)); Vu[nx:, :] = np.eye(nu) ##Vx und Vu ordnen die Zustände $x$ und Stellgrößen $u$ dem kombinierten Ausgabevektor $y = [x^T, u^T]^T$ zu.
     ocp.cost.Vx, ocp.cost.Vu, ocp.cost.Vx_e = Vx, Vu, np.eye(nx)
     ocp.cost.yref, ocp.cost.yref_e = np.zeros(ny), np.zeros(nx)
     ocp.constraints.lbu = np.array([-max_angle, -max_angle, -0.5, max(4 * params["thrust_min"], t_min)])
@@ -106,12 +110,12 @@ def create_mpc_solver(params: dict, N: int, Tf: float, Q, R_, max_angle: float, 
     ocp.constraints.x0 = np.zeros(nx)
     so = ocp.solver_options
     so.qp_solver = "PARTIAL_CONDENSING_HPIPM"
-    so.hessian_approx = "GAUSS_NEWTON"
-    so.integrator_type = "ERK"
+    so.hessian_approx = "GAUSS_NEWTON"  ##Gauss-Newton-Approximation für beschleunigte Konvergenz.
+    so.integrator_type = "ERK"          ##Explizites Runge-Kutta-Verfahren (4. Ordnung) zur Simulation der Flugphysik innerhalb des Horizonts.
     so.nlp_solver_type = "SQP_RTI" if rti else "SQP"
-    so.nlp_solver_max_iter = 20
+    so.nlp_solver_max_iter = 20         ##(Real-Time Iteration). Führt nur eine einzige SQP-Iteration pro Zeitschritt aus, um extrem schnelle Antwortzeiten <20ms zu garantieren.
     so.qp_solver_warm_start = 1
-    so.tf = Tf
+    so.tf = Tf                          ##Prädiktionshorizont (0,5 Sekunden).
     solver = AcadosOcpSolver(ocp, json_file=f"c_generated_code/{model.name}.json", verbose=False)
     _SOLVERS[key] = solver
     return solver
@@ -274,6 +278,11 @@ class MPCController(Controller):
             windows[a][2] = float(np.clip(windows[b][0] - 0.25 - windows[a][1], 0.1, self.T_OUT_MAX))
         return windows
 
+
+    ##Absolutes Minimum an Ruck ($\dddot{x} \to \text{min}$)Mathematisch bewiesen die schonendste Bewegungsform.Minimiert die 3. Ableitung der Position (den Ruck), wodurch Schläge und abrupte Krafteinwirkungen auf Motoren, Regler und den Drohnenrahmen verhindert werden.Perfekte Übergänge an allen Rändern (6 Randbedingungen)Erfüllt an beiden Enden ($x=0$ und $x=1$) exakt 6 physische Nullstellen:Position: Verbindet Start- und Zielwert punktgenau.Geschwindigkeit: Startet und endet mit $0$ (kein Geschwindigkeits-Sprung).Beschleunigung: Startet und endet mit $0$ (keine plötzliche Kraftspitze).Das niedrigste mögliche Polynom (Grad 5)Es ist das einzige Polynom niedrigsten Grades, das alle 6 Randbedingungen gleichzeitig erfüllt.Höhere Polynome (z. B. Grad 7) sind rechenintensiver, während niedrigere Polynome (z. B. Grad 3 oder 4) Knicke und Kraftsprünge an den Rändern hinterlassen.
+    ##mathematische basis 
+    ##der mathematische Ruck (engl. Jerk), also die 3. Ableitung der Position nach der Zeit ($\dddot{x}$).
+    ##$$w(0) = 0, \quad w(1) = 1$$$$\dot{w}(0) = 0, \quad \dot{w}(1) = 0 \quad \text{(Anfang/Ende in Ruhe)}$$$$\ddot{w}(0) = 0, \quad \ddot{w}(1) = 0 \quad \text{(keine plötzliche Kraft)}$$
     @staticmethod
     def _min_jerk(x):
         """Weiche Rampe von 0 auf 1 und ihre ersten beiden Ableitungen nach x."""
@@ -284,6 +293,7 @@ class MPCController(Controller):
             60 * x - 180 * x**2 + 120 * x**3,
         )
 
+    ##nutzt mathematische basis der min_jerk funktion und wendet es auf das Physikalisches Zeitfenster an -> steuert den gesamten Lebenszyklus einer Korrektur (Einblenden $\rightarrow$ Halten $\rightarrow$ Ausblenden)
     def _ramp(self, t, t_start, t_full, t_down, t_out):
         """Gewicht 0 -> 1 (t_start bis t_full), 1 bis t_down, dann 1 -> 0 in t_out. Mit Ableitungen."""
         T_in = t_full - t_start
@@ -295,7 +305,11 @@ class MPCController(Controller):
         w2 = np.where(up, w2_up / T_in**2, -w2_dn / t_out**2)
         return w, w1, w2
 
+    ##_reference nimmt dann w,w1,w2 aus _ramp und das kam ja aus _min_jerk
+    ###über reference (online anpassung lokal) passt er die offline geplante Bahn (racing line) an die echten Gate-Positionen an, sobald diese sichtbar werden. (0.7m)
     def _reference(self, t):
+        ##clip: Stellt sicher, dass Zeit ($t$) nicht vor Start ($0.0$) oder nach Rennende 
+        ##self._spline liefert für Zeitpunkt ($t$)  ungeänderte Offline-Position ($p$). Die 1. Ableitung ist die Soll-Geschwindigkeit ($v$), die 2. Ableitung die Soll-Beschleunigung ($a$)
         """Sollposition, -geschwindigkeit und -beschleunigung inkl. Gate-Korrekturen (t: Array)."""
         t = np.clip(np.atleast_1d(np.asarray(t, dtype=float)), 0.0, self._t_total)
         p, v, a = self._spline(t), self._spline(t, 1), self._spline(t, 2)
@@ -304,32 +318,37 @@ class MPCController(Controller):
             g = self._pass_gate[k]
             if g not in self._gate_corr:
                 continue
-            t_rev, M, g_nom, g_true = self._gate_corr[g]
+            t_rev, M, g_nom, g_true = self._gate_corr[g]  ##t_rev: Zeitpunkt, an dem das Gate aufgedeckt wurde.
             t_full, t_down, t_out = self._windows[k]
             earlier = [kk for kk in self._pass_t if kk < k]
-            # Einblenden erst, wenn das vorherige Gate hinter uns liegt
+            # Einblenden erst, wenn das vorherige Gate hinter uns liegt -> t_start: Die Korrektur beginnt erst, wenn das vorherige Gate sicher passiert/abgeschlossen ist (oder sofort bei Sichtung).
             t_start = max(t_rev, self._windows[max(earlier)][1] if earlier else 0.0)
-            t_full = max(t_full, t_start + self.T_MIN_IN)
-            t_down = max(t_down, t_full)
+            t_full = max(t_full, t_start + self.T_MIN_IN) ##t_full: Zeitpunkt, ab dem die Korrektur zu 100 % wirkt. Um abrupte Sprünge zu vermeiden, wird mindestens T_MIN_IN (0.3 s) Einblendzeit eingeplant.
+            t_down = max(t_down, t_full)             ##t_down / t_out: Zeitpunkt, ab dem die Korrektur nach dem Durchflug wieder sanft ausgeblendet wird.
+            ##$w$ (Gewicht): Ein Wert zwischen $0.0$ (keine Korrektur) und $1.0$ (volle Korrektur).
+            ##$w_1, w_2$: Die 1. und 2. Ableitung dieser Übergangsfunktion nach der Zeit ($\dot{w}$ und $\ddot{w}$). Sie basieren auf einem Minimum-Jerk-Polynom ($10x^3 - 15x^4 + 6x^5$), damit der Übergang ruckfrei verläuft.
             w, w1, w2 = (x[:, None] for x in self._ramp(t, t_start, t_full, t_down, t_out))
-            c = g_true + (p - g_nom) @ M.T - p  # Bahn starr mit dem Gate verschieben und drehen
-            c1 = v @ M.T - v
+            ##c (Positionsversatz): Nimmt den Punkt relativ zum Soll-Gate $(p - g_{nom})$, dreht ihn um die Drehmatrix $M$ und platziert ihn am realen Gate $g_{true}$. Abzüglich der ursprünglichen Position $p$ ergibt sich der reine Korrekturvektor $\Delta p$.
+            c = g_true + (p - g_nom) @ M.T - p       # Bahn starr mit dem Gate verschieben und drehen
+            c1 = v @ M.T - v                         ##c1 & c2: Drehen auch die Geschwindigkeits- und Beschleunigungsvektoren entsprechend mit.
             c2 = a @ M.T - a
-            P += w * c
-            V += w * c1 + w1 * c
-            A += w * c2 + 2 * w1 * c1 + w2 * c
+            P += w * c                               ##Da $P(t) = p(t) + w(t) \cdot c(t)$ gilt, greift beim Ableiten die Produktregel:Position: ## $P = p + w \cdot c$
+            V += w * c1 + w1 * c                     ## Geschwindigkeit: $\dot{P} = \dot{p} + w \cdot \dot{c} + \dot{w} \cdot c = v + w \cdot c_1 + w_1 \cdot c$
+            A += w * c2 + 2 * w1 * c1 + w2 * c       ## Beschleunigung: $\ddot{P} = a + w \cdot c_2 + 2 w_1 c_1 + w_2 c$
         return P, V, A
 
     def _update_gates(self, obs, t):
         """Neu aufgedeckte Gates: Korrektur aus echter und nominaler Lage bestimmen."""
         for g in range(len(self._nom_gate_pos)):
-            if g in self._gate_corr or not obs["gates_visited"][g]:
-                continue
-            true_yaw = R.from_quat(obs["gates_quat"][g]).as_euler("xyz")[2]
-            dyaw = (true_yaw - self._nom_gate_yaw[g] + np.pi) % (2 * np.pi) - np.pi
-            M = self._yaw_matrix(self.ROT_SCALE * dyaw)
+            if g in self._gate_corr or not obs["gates_visited"][g]: ##g in self._gate_corr: Wenn für Gate bereits Korrektur berechnet,nicht noch einmal berechnen, not obs["gates_visited"][g]: Gate wurde vom Sensor noch nicht gesichtet/aufgedeckt (noch mehr als 0.7m entfernt),
+                continue 
+            true_yaw = R.from_quat(obs["gates_quat"][g]).as_euler("xyz")[2] 
+            dyaw = (true_yaw - self._nom_gate_yaw[g] + np.pi) % (2 * np.pi) - np.pi  ##Uns interessiert nur die Drehung um die Z-Achse ([2] = Yaw / Gierwinkel). ##direkt inklusive modulo-Operation, um den Winkel in den Bereich [-π, π] zu bringen (kürzester Drehwinkel).
+            M = self._yaw_matrix(self.ROT_SCALE * dyaw) ##Gedämpfte Drehung: Der Code übernimmt nicht zwingend die volle Drehung des Gates auf die Flugbahn, sondern skaliert sie mit self.ROT_SCALE (im Code meist 0.5). Das bedeutet: Die Flugbahn dreht sich nur zu 50 % mit dem Gate mit, damit die Kurve vor/nach dem Gate nicht zu extrem verbogen wird.self._yaw_matrix(...): Erzeugt eine standardmäßige $3 \times 3$ Rotationsmatrix für eine Drehung um die Z-Achse im Raum.
             self._gate_corr[g] = (t, M, self._nom_gate_pos[g], np.array(obs["gates_pos"][g]))
 
+
+    ##wirkliche umsetzung des MPC
     def compute_control(
         self, obs: dict[str, NDArray[np.floating]], info: dict | None = None
     ) -> NDArray[np.floating]:
