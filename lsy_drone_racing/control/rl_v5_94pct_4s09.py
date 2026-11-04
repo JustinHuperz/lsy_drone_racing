@@ -50,6 +50,14 @@ MODE = "auto"
 THRUST_SCALE = 1.0  # nur echter Betrieb: Faktor auf den Schubbefehl (Kalibrierung im Labor)
 
 
+# HINWEIS: Quaternionen (x,y,z,w) verhindern den "Gimbal Lock".
+# Bei Euler-Winkeln (Roll/Pitch/Yaw) richten sich bei 90° Pitch zwei Drehachsen
+# parallel aus -> ein Freiheitsgrad geht verloren.
+# quat_to_mat wandelt die 4 Wert-Darstellung in eine 3x3 Rotationsmatrix um,
+# damit das neuronale Netz die Orientierung ohne Kopplungsprobleme verarbeiten kann.
+##genutzt fürobs["quat"]: wie die Drohne gerade gekippt und gedreht ist.
+##genutzt für obs["gates_quat"]: wie jedes Gate im Raum steht.
+# nutzen der 3x3 matrix: Mehrdeutigkeit: q und -q beschreiben genau dieselbe Drehung
 def quat_to_mat(q: NDArray) -> NDArray:
     """Quaternion(en) xyzw (..., 4) -> Rotationsmatrix (..., 3, 3)."""
     x, y, z, w = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
